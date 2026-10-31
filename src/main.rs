@@ -11,9 +11,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, KeyBinding, Render, ScrollHandle, Task,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, quad,
-    relative, rgb, size, transparent_black,
+    AnyElement, App, Application, Bounds, Context, DispatchPhase, Entity, KeyBinding, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, Task, TitlebarOptions,
+    Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, quad, relative, rgb,
+    size, transparent_black,
 };
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
@@ -91,6 +92,10 @@ struct Main {
     /// Scroll state of the file list, shared with the list element so the
     /// scrollbar overlay can read the current offset.
     scroll_handle: ScrollHandle,
+    /// Where the pointer grabbed the scrollbar thumb, in px from the thumb's
+    /// top; `None` when no drag is in progress. Lives on the view so a repaint
+    /// mid-drag cannot reset it.
+    bar_grab: Option<f32>,
 }
 
 impl Main {
@@ -118,6 +123,7 @@ impl Main {
             format_field: cx.new(|cx| Field::new("YYYYMMDD", cx)),
             save_error: None,
             scroll_handle: ScrollHandle::new(),
+            bar_grab: None,
         }
     }
 
@@ -480,7 +486,7 @@ impl Main {
             )
     }
 
-    fn rows_area(&self, window: &Window) -> AnyElement {
+    fn rows_area(&self, window: &Window, cx: &Context<Self>) -> AnyElement {
         if self.rows.is_empty() {
             return div().flex_1()
                 .min_h_0()
@@ -498,8 +504,9 @@ impl Main {
         // be empty on the first paint and stale after a Refresh, because gpui
         // updates the handle in prepaint, after render. Teach rows a second
         // line or more padding and this formula must follow.
-        let content = (window.line_height() + px(12.)) * self.rows.len() as f32;
+        let content = f32::from((window.line_height() + px(12.)) * self.rows.len() as f32);
         let scroll_handle = self.scroll_handle.clone();
+        let weak = cx.weak_entity();
         const BAR_INSET: f32 = 6.;
         div().relative()
             .flex_1()
@@ -564,13 +571,12 @@ impl Main {
                         // is taller than the strip; a list that only overflows
                         // into that inset still fits and draws no bar.
                         let viewport = strip + BAR_INSET * 2.;
-                        let content = f32::from(content);
                         (content > viewport).then(|| {
                             let scrolled = (-f32::from(scroll_handle.offset().y)).max(0.);
                             thumb_geometry(strip, content, scrolled)
                         })
                     },
-                    |bounds, thumb, window, _cx| {
+                    move |bounds, thumb, window, _cx| {
                         let Some(thumb) = thumb else { return };
                         let draw = |window: &mut Window, height: f32, offset: f32, color: u32| {
                             window.paint_quad(quad(
@@ -587,6 +593,84 @@ impl Main {
                         };
                         draw(window, f32::from(bounds.size.height), 0., 0x232b3a);
                         draw(window, thumb.height, thumb.offset, 0x44505e);
+
+                        // Window-level listeners are legal only during paint.
+                        // They are not tied to a hitbox, so the bar never
+                        // swallows the wheel. Drag state lives on the view, so
+                        // the repaints a drag triggers cannot reset the grab.
+                        let strip = f32::from(bounds.size.height);
+                        let viewport = strip + BAR_INSET * 2.;
+                        window.on_mouse_event({
+                            let weak = weak.clone();
+                            move |event: &MouseDownEvent, phase, _window, cx| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.button != MouseButton::Left
+                                {
+                                    return;
+                                }
+                                // A press anywhere else ends any drag whose
+                                // release we missed (e.g. let go off-window).
+                                if !bounds.contains(&event.position) {
+                                    let _ = weak.update(cx, |this, _| this.bar_grab = None);
+                                    return;
+                                }
+                                let pointer =
+                                    f32::from(event.position.y) - f32::from(bounds.top());
+                                let _ = weak.update(cx, |this, cx| {
+                                    let scrolled =
+                                        (-f32::from(this.scroll_handle.offset().y)).max(0.);
+                                    let bar = thumb_geometry(strip, content, scrolled);
+                                    if pointer >= bar.offset && pointer <= bar.offset + bar.height {
+                                        this.bar_grab = Some(pointer - bar.offset);
+                                        return;
+                                    }
+                                    let offset = scroll_offset_for_pointer(
+                                        strip,
+                                        content,
+                                        viewport,
+                                        pointer,
+                                        bar.height / 2.,
+                                    );
+                                    this.scroll_handle
+                                        .set_offset(point(px(0.), px(-offset)));
+                                    cx.notify();
+                                });
+                            }
+                        });
+                        window.on_mouse_event({
+                            let weak = weak.clone();
+                            move |event: &MouseMoveEvent, phase, _window, cx| {
+                                if phase != DispatchPhase::Bubble || !event.dragging() {
+                                    return;
+                                }
+                                let pointer =
+                                    f32::from(event.position.y) - f32::from(bounds.top());
+                                let _ = weak.update(cx, |this, cx| {
+                                    let Some(grab) = this.bar_grab else { return };
+                                    let offset = scroll_offset_for_pointer(
+                                        strip, content, viewport, pointer, grab,
+                                    );
+                                    let scrolled =
+                                        (-f32::from(this.scroll_handle.offset().y)).max(0.);
+                                    if (offset - scrolled).abs() > f32::EPSILON {
+                                        this.scroll_handle
+                                            .set_offset(point(px(0.), px(-offset)));
+                                        cx.notify();
+                                    }
+                                });
+                            }
+                        });
+                        window.on_mouse_event({
+                            let weak = weak.clone();
+                            move |event: &MouseUpEvent, phase, _window, cx| {
+                                if phase != DispatchPhase::Bubble
+                                    || event.button != MouseButton::Left
+                                {
+                                    return;
+                                }
+                                let _ = weak.update(cx, |this, _| this.bar_grab = None);
+                            }
+                        });
                     },
                 )
                 .absolute()
@@ -820,13 +904,28 @@ fn thumb_geometry(track: f32, content: f32, offset: f32) -> Thumb {
     }
 }
 
+/// Scroll position (px from the top) that puts the thumb's top at
+/// `pointer - grab` on a `track`-tall bar, where `grab` is how far into the
+/// thumb the pointer is. A track click passes half the thumb height so the
+/// thumb centres on the click. Clamped to the list's real scroll range, whose
+/// viewport is the bar plus its top and bottom insets.
+fn scroll_offset_for_pointer(track: f32, content: f32, viewport: f32, pointer: f32, grab: f32) -> f32 {
+    let max_scroll = (content - viewport).max(0.);
+    let travel = (track - thumb_geometry(track, content, 0.).height).max(0.);
+    if max_scroll == 0. || travel == 0. {
+        return 0.;
+    }
+    let top = (pointer - grab).clamp(0., travel);
+    (top / travel * (content - track)).clamp(0., max_scroll)
+}
+
 impl Render for Main {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.screen == Screen::Settings {
             return self.settings_view(cx);
         }
         let header = self.header();
-        let rows_area = self.rows_area(window);
+        let rows_area = self.rows_area(window, cx);
         div().size_full()
             .flex()
             .flex_col()
@@ -892,7 +991,7 @@ impl Render for Main {
 
 #[cfg(test)]
 mod tests {
-    use super::{Thumb, thumb_geometry};
+    use super::{Thumb, scroll_offset_for_pointer, thumb_geometry};
 
     #[test]
     fn a_list_that_fits_gets_a_full_height_thumb_at_the_top() {
@@ -935,6 +1034,52 @@ mod tests {
 
         // Overscroll past the end stays pinned instead of running off the track.
         assert_eq!(thumb_geometry(400., 800., 9_999.).offset, 200.);
+    }
+
+    #[test]
+    fn a_track_click_maps_proportionally() {
+        // Half the content fits, so the middle of the track is halfway down
+        // the list. A click is centred on the thumb: grab = thumb.height / 2.
+        assert_eq!(
+            scroll_offset_for_pointer(400., 800., 400., 200., 100.),
+            200.
+        );
+    }
+
+    #[test]
+    fn a_drag_past_either_end_clamps_to_the_scroll_range() {
+        assert_eq!(scroll_offset_for_pointer(400., 800., 400., -50., 0.), 0.);
+        assert_eq!(
+            scroll_offset_for_pointer(400., 800., 400., 9_999., 0.),
+            400.
+        );
+    }
+
+    #[test]
+    fn the_bottom_clamp_uses_the_list_viewport() {
+        // The bar is inset inside the list viewport, so the list runs out of
+        // scroll before the pointer reaches the track's bottom.
+        assert_eq!(
+            scroll_offset_for_pointer(400., 800., 412., 9_999., 0.),
+            388.
+        );
+    }
+
+    #[test]
+    fn grabbing_the_thumb_keeps_the_grab_offset() {
+        // Thumb at scroll 200 sits 100px down the track, 200px tall. Grab it
+        // 50px from its top and the drag maps straight back to scroll 200.
+        let thumb = thumb_geometry(400., 800., 200.);
+        assert_eq!(thumb.offset, 100.);
+        assert_eq!(
+            scroll_offset_for_pointer(400., 800., 400., thumb.offset + 50., 50.),
+            200.
+        );
+    }
+
+    #[test]
+    fn a_list_that_fits_stays_at_the_top() {
+        assert_eq!(scroll_offset_for_pointer(300., 200., 300., 150., 0.), 0.);
     }
 }
 
