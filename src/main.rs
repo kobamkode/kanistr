@@ -30,6 +30,11 @@ const ACCENT: (u32, u32) = (0x2f6feb, 0x4f8cff);
 /// Neutral pill colours: Back, Cancel, Refresh, stepper, USB fix Off.
 const NEUTRAL: (u32, u32) = (0x2a3242, 0x3a465e);
 
+/// File-list scrollbar: vertical inset of the bar from the list's edges, and
+/// how far the painted thumb sits inside the bar on each side.
+const BAR_INSET: f32 = 6.;
+const THUMB_INSET: f32 = 1.;
+
 #[derive(Clone, Copy, PartialEq)]
 enum RowState {
     Pending,
@@ -133,14 +138,9 @@ impl Main {
         }
     }
 
-    /// Height of the rows' content in logical pixels. shortcut: one text line
-    /// plus the 12px of vertical padding each row carries (`py(px(6.))`).
-    /// Reading `scroll_handle.max_offset()` instead would be empty on the
-    /// first paint and stale after a Refresh, because gpui updates the handle
-    /// in prepaint, after render. Teach rows a second line or more padding and
-    /// this formula must follow.
+    /// Height of the rows' content in logical pixels.
     fn content_height(&self, line_height: Pixels) -> f32 {
-        f32::from((line_height + px(12.)) * self.rows.len() as f32)
+        content_height(f32::from(line_height), self.rows.len())
     }
 
     fn status(&self) -> &'static str {
@@ -201,7 +201,7 @@ impl Main {
         // A fresh scan starts at the first file. `set_offset` does not notify,
         // so the `cx.notify()` below is what repaints the list and the bar.
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
-        // Refreshing rejoins the tail, ready for the next run. Nothing moves
+        // Refreshing rejoins the tail, ready for the next run. Nothing scrolls
         // until one starts.
         self.follow = true;
         self.reset_run();
@@ -328,6 +328,8 @@ impl Main {
             this.update(cx, |this, cx| {
                 this.running = false;
                 this.finished = true;
+                // The run is over, so the list stays where the user left it.
+                this.follow = false;
                 this.elapsed = this.started_at.take().map(|started| started.elapsed());
                 cx.notify();
             })
@@ -532,7 +534,6 @@ impl Main {
         let content = self.content_height(window.line_height());
         let scroll_handle = self.scroll_handle.clone();
         let weak = cx.weak_entity();
-        const BAR_INSET: f32 = 6.;
         div().relative()
             .flex_1()
             .min_h_0()
@@ -560,13 +561,11 @@ impl Main {
                             }
                             let viewport =
                                 f32::from(this.scroll_handle.bounds().size.height);
-                            let max_scroll =
-                                (this.content_height(line_height) - viewport).max(0.);
-                            let scrolled =
-                                (-f32::from(this.scroll_handle.offset().y)).max(0.);
+                            let limit = max_scroll(this.content_height(line_height), viewport);
+                            let scrolled = scrolled(&this.scroll_handle);
                             if delta > 0. {
                                 this.follow = false;
-                            } else if at_bottom(scrolled - delta, max_scroll) {
+                            } else if at_bottom(scrolled - delta, limit) {
                                 this.follow = true;
                             }
                         },
@@ -618,43 +617,61 @@ impl Main {
                 // The bar is a canvas because gpui 0.2.2 ships no scrollbar
                 // element. It deliberately has no id and no hitbox, so it never
                 // becomes a mouse target and the wheel reaches the list under
-                // its strip. It overlays the rows' right margin only.
+                // the track. It overlays the rows' right margin only.
+                // Declared after the rows so its prepaint already reads this
+                // frame's clamped scroll offset.
                 canvas(
                     move |bounds, _window, _cx| {
-                        let strip = f32::from(bounds.size.height);
+                        let track = f32::from(bounds.size.height);
                         // The bar is inset top and bottom, so the list viewport
-                        // is taller than the strip; a list that only overflows
+                        // is taller than the track; a list that only overflows
                         // into that inset still fits and draws no bar.
-                        let viewport = strip + BAR_INSET * 2.;
+                        let viewport = bar_viewport(track);
                         (content > viewport).then(|| {
-                            let scrolled = (-f32::from(scroll_handle.offset().y)).max(0.);
-                            thumb_geometry(strip, content, viewport, scrolled)
+                            thumb_geometry(track, content, viewport, scrolled(&scroll_handle))
                         })
                     },
                     move |bounds, thumb, window, _cx| {
                         let Some(thumb) = thumb else { return };
-                        let draw = |window: &mut Window, height: f32, offset: f32, color: u32| {
+                        let track = f32::from(bounds.size.height);
+                        let viewport = bar_viewport(track);
+                        let draw = |window: &mut Window,
+                                    left: f32,
+                                    width: f32,
+                                    height: f32,
+                                    offset: f32,
+                                    radius: f32,
+                                    color: u32| {
                             window.paint_quad(quad(
                                 Bounds::new(
-                                    point(bounds.left(), bounds.top() + px(offset)),
-                                    size(bounds.size.width, px(height)),
+                                    point(bounds.left() + px(left), bounds.top() + px(offset)),
+                                    size(px(width), px(height)),
                                 ),
-                                px(3.),
+                                px(radius),
                                 rgb(color),
                                 px(0.),
                                 transparent_black(),
                                 Default::default(),
                             ));
                         };
-                        draw(window, f32::from(bounds.size.height), 0., 0x232b3a);
-                        draw(window, thumb.height, thumb.offset, 0x44505e);
+                        // Track full width; thumb inset 1px each side with a
+                        // tighter radius so it reads as sitting inside the bar.
+                        let width = f32::from(bounds.size.width);
+                        draw(window, 0., width, track, 0., 3., 0x232b3a);
+                        draw(
+                            window,
+                            THUMB_INSET,
+                            width - THUMB_INSET * 2.,
+                            thumb.height,
+                            thumb.offset,
+                            2.,
+                            0x44505e,
+                        );
 
                         // Window-level listeners are legal only during paint.
                         // They are not tied to a hitbox, so the bar never
                         // swallows the wheel. Drag state lives on the view, so
                         // the repaints a drag triggers cannot reset the grab.
-                        let strip = f32::from(bounds.size.height);
-                        let viewport = strip + BAR_INSET * 2.;
                         window.on_mouse_event({
                             let weak = weak.clone();
                             move |event: &MouseDownEvent, phase, _window, cx| {
@@ -672,15 +689,22 @@ impl Main {
                                 let pointer =
                                     f32::from(event.position.y) - f32::from(bounds.top());
                                 let _ = weak.update(cx, |this, cx| {
-                                    let scrolled =
-                                        (-f32::from(this.scroll_handle.offset().y)).max(0.);
-                                    let bar = thumb_geometry(strip, content, viewport, scrolled);
+                                    let scrolled = scrolled(&this.scroll_handle);
+                                    let bar =
+                                        thumb_geometry(track, content, viewport, scrolled);
                                     if pointer >= bar.offset && pointer <= bar.offset + bar.height {
                                         this.bar_grab = Some(pointer - bar.offset);
+                                        // A press on the thumb pauses following
+                                        // where the list already is, so the
+                                        // next row cannot yank it.
+                                        this.follow = at_bottom(
+                                            scrolled,
+                                            max_scroll(content, viewport),
+                                        );
                                         return;
                                     }
                                     let offset = scroll_offset_for_pointer(
-                                        strip,
+                                        track,
                                         content,
                                         viewport,
                                         pointer,
@@ -688,7 +712,7 @@ impl Main {
                                     );
                                     // A click at the bottom rejoins the tail.
                                     this.follow =
-                                        at_bottom(offset, (content - viewport).max(0.));
+                                        at_bottom(offset, max_scroll(content, viewport));
                                     this.scroll_handle
                                         .set_offset(point(px(0.), px(-offset)));
                                     cx.notify();
@@ -706,14 +730,13 @@ impl Main {
                                 let _ = weak.update(cx, |this, cx| {
                                     let Some(grab) = this.bar_grab else { return };
                                     let offset = scroll_offset_for_pointer(
-                                        strip, content, viewport, pointer, grab,
+                                        track, content, viewport, pointer, grab,
                                     );
                                     // Dragging away from the bottom leaves the
                                     // tail; dragging back rejoins it.
                                     this.follow =
-                                        at_bottom(offset, (content - viewport).max(0.));
-                                    let scrolled =
-                                        (-f32::from(this.scroll_handle.offset().y)).max(0.);
+                                        at_bottom(offset, max_scroll(content, viewport));
+                                    let scrolled = scrolled(&this.scroll_handle);
                                     if (offset - scrolled).abs() > f32::EPSILON {
                                         this.scroll_handle
                                             .set_offset(point(px(0.), px(-offset)));
@@ -936,15 +959,41 @@ impl Main {
     }
 }
 
+/// Height of the rows' content in logical pixels, given the line height and
+/// row count. shortcut: one text line plus the 12px of vertical padding each
+/// row carries (`py(px(6.))`). Reading `scroll_handle.max_offset()` instead
+/// would be empty on the first paint and stale after a Refresh, because gpui
+/// updates the handle in prepaint, after render. Teach rows a second line or
+/// more padding and this formula must follow.
+fn content_height(line_height: f32, rows: usize) -> f32 {
+    (line_height + 12.) * rows as f32
+}
+
+/// How far the list is scrolled from the top, in logical pixels.
+fn scrolled(handle: &ScrollHandle) -> f32 {
+    (-f32::from(handle.offset().y)).max(0.)
+}
+
+/// Height of the list viewport a `track`-tall bar sits in. The bar is inset
+/// top and bottom, so the list runs on past the track by that inset.
+fn bar_viewport(track: f32) -> f32 {
+    track + BAR_INSET * 2.
+}
+
+/// The largest scroll offset the list can reach, never negative.
+fn max_scroll(content: f32, viewport: f32) -> f32 {
+    (content - viewport).max(0.)
+}
+
 /// Height and top offset of the file list's scrollbar thumb, in logical pixels.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, PartialEq)]
 struct Thumb {
     height: f32,
     offset: f32,
 }
 
 /// Thumb geometry for a `track`-tall bar over `content`-tall rows in a
-/// `viewport`-tall list scrolled `offset` from the top. The strip is inset, so
+/// `viewport`-tall list scrolled `offset` from the top. The bar is inset, so
 /// the viewport is taller than the track. A list that fits gets a full-height
 /// thumb at the top (the caller then draws no bar); a longer list gets a thumb
 /// proportional to the visible fraction, never shorter than the grab minimum,
@@ -978,13 +1027,13 @@ fn scroll_offset_for_pointer(
     pointer: f32,
     grab: f32,
 ) -> f32 {
-    let max_scroll = (content - viewport).max(0.);
+    let limit = max_scroll(content, viewport);
     let travel = (track - thumb_geometry(track, content, viewport, 0.).height).max(0.);
-    if max_scroll == 0. || travel == 0. {
+    if limit == 0. || travel == 0. {
         return 0.;
     }
     let top = (pointer - grab).clamp(0., travel);
-    (top / travel * max_scroll).clamp(0., max_scroll)
+    (top / travel * limit).clamp(0., limit)
 }
 
 /// Whether a list scrolled `offset` logical pixels from the top has reached
@@ -1065,7 +1114,37 @@ impl Render for Main {
 
 #[cfg(test)]
 mod tests {
-    use super::{Thumb, at_bottom, scroll_offset_for_pointer, thumb_geometry};
+    use gpui::{ScrollHandle, point, px};
+
+    use super::{
+        Thumb, at_bottom, bar_viewport, content_height, max_scroll, scroll_offset_for_pointer,
+        scrolled, thumb_geometry,
+    };
+
+    #[test]
+    fn content_height_is_one_text_line_plus_padding_per_row() {
+        // A row is one line of text plus 12px of vertical padding.
+        assert_eq!(content_height(20., 0), 0.);
+        assert_eq!(content_height(20., 1), 32.);
+        assert_eq!(content_height(20., 7), 7. * 32.);
+    }
+
+    #[test]
+    fn the_bar_inset_belongs_to_the_list_viewport() {
+        assert_eq!(bar_viewport(388.), 400.);
+        assert_eq!(max_scroll(500., 400.), 100.);
+        // A list shorter than its viewport cannot scroll.
+        assert_eq!(max_scroll(300., 400.), 0.);
+    }
+
+    #[test]
+    fn scrolled_distance_is_positive_in_the_scroll_direction() {
+        let handle = ScrollHandle::new();
+        handle.set_offset(point(px(0.), px(-120.)));
+        assert_eq!(scrolled(&handle), 120.);
+        handle.set_offset(point(px(0.), px(0.)));
+        assert_eq!(scrolled(&handle), 0.);
+    }
 
     #[test]
     fn the_top_of_a_scrollable_list_is_not_the_bottom() {
@@ -1133,7 +1212,7 @@ mod tests {
 
     #[test]
     fn an_inset_bar_reaches_the_track_bottom_at_the_end() {
-        // The 388px strip sits inside a 400px list viewport (6px inset top and
+        // The 388px track sits inside a 400px list viewport (6px inset top and
         // bottom), and 500px of rows just overflows it.
         let track = 388.;
         let viewport = 400.;
