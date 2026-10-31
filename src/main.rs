@@ -12,9 +12,9 @@ use std::time::{Duration, Instant};
 
 use gpui::{
     AnyElement, App, Application, Bounds, Context, DispatchPhase, Entity, KeyBinding, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Render, ScrollHandle, Task, TitlebarOptions,
-    Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, quad, relative, rgb,
-    size, transparent_black,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollHandle, ScrollWheelEvent,
+    Task, TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px,
+    quad, relative, rgb, size, transparent_black,
 };
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
@@ -96,6 +96,11 @@ struct Main {
     /// top; `None` when no drag is in progress. Lives on the view so a repaint
     /// mid-drag cannot reset it.
     bar_grab: Option<f32>,
+    /// Whether the file list follows the tail as Import rows land. Set when a
+    /// run starts or the list is re-scanned, and by user input: wheel-up (or a
+    /// bar grab) leaves the tail, wheel-down to the bottom or a bar grab at
+    /// the bottom rejoins it. Only acts while `running`.
+    follow: bool,
 }
 
 impl Main {
@@ -124,7 +129,18 @@ impl Main {
             save_error: None,
             scroll_handle: ScrollHandle::new(),
             bar_grab: None,
+            follow: false,
         }
+    }
+
+    /// Height of the rows' content in logical pixels. shortcut: one text line
+    /// plus the 12px of vertical padding each row carries (`py(px(6.))`).
+    /// Reading `scroll_handle.max_offset()` instead would be empty on the
+    /// first paint and stale after a Refresh, because gpui updates the handle
+    /// in prepaint, after render. Teach rows a second line or more padding and
+    /// this formula must follow.
+    fn content_height(&self, line_height: Pixels) -> f32 {
+        f32::from((line_height + px(12.)) * self.rows.len() as f32)
     }
 
     fn status(&self) -> &'static str {
@@ -185,6 +201,9 @@ impl Main {
         // A fresh scan starts at the first file. `set_offset` does not notify,
         // so the `cx.notify()` below is what repaints the list and the bar.
         self.scroll_handle.set_offset(point(px(0.), px(0.)));
+        // Refreshing rejoins the tail, ready for the next run. Nothing moves
+        // until one starts.
+        self.follow = true;
         self.reset_run();
         cx.notify();
     }
@@ -217,6 +236,8 @@ impl Main {
         }
         self.reset_run();
         self.running = true;
+        // An Import watches its own tail until the user scrolls away.
+        self.follow = true;
         // A few unprivileged sysfs reads, cheap enough for the UI thread: a
         // run that needs nothing must never show "applying…" or spawn sudo.
         // The fix is Linux-only; elsewhere the toggle is hidden and this is
@@ -323,6 +344,9 @@ impl Main {
             return;
         }
         self.cancelled = true;
+        // Stop following now: the in-flight rows still land, but the list must
+        // stay where the user left it.
+        self.follow = false;
         cx.notify();
     }
 
@@ -391,6 +415,12 @@ impl Main {
                 row.state = RowState::Failed;
                 self.failed += 1;
             }
+        }
+        // Following the tail: the request is consumed in prepaint, so the
+        // caller's notify is all the repaint it needs. A cancelled run's
+        // in-flight rows land without moving the list.
+        if self.running && !self.cancelled && self.follow {
+            self.scroll_handle.scroll_to_bottom();
         }
     }
 
@@ -499,12 +529,7 @@ impl Main {
                 )
                 .into_any_element();
         }
-        // shortcut: content height is one text line plus the rows' 12px of
-        // vertical padding (`py(px(6.))`). Reading `max_offset()` instead would
-        // be empty on the first paint and stale after a Refresh, because gpui
-        // updates the handle in prepaint, after render. Teach rows a second
-        // line or more padding and this formula must follow.
-        let content = f32::from((window.line_height() + px(12.)) * self.rows.len() as f32);
+        let content = self.content_height(window.line_height());
         let scroll_handle = self.scroll_handle.clone();
         let weak = cx.weak_entity();
         const BAR_INSET: f32 = 6.;
@@ -516,6 +541,36 @@ impl Main {
                     .size_full()
                     .overflow_y_scroll()
                     .track_scroll(&self.scroll_handle)
+                    // Leaving or rejoining the tail is derived from the wheel
+                    // like a pager: up pauses following, down at the bottom
+                    // resumes it. Only during a run. gpui's own scroll
+                    // listener handles the same event in an unspecified
+                    // order, so predict the landing offset from the current
+                    // one; an overshoot on either ordering still satisfies
+                    // the predicate.
+                    .on_scroll_wheel(cx.listener(
+                        |this, event: &ScrollWheelEvent, window, _cx| {
+                            if !this.running {
+                                return;
+                            }
+                            let line_height = window.line_height();
+                            let delta = f32::from(event.delta.pixel_delta(line_height).y);
+                            if delta == 0. {
+                                return;
+                            }
+                            let viewport =
+                                f32::from(this.scroll_handle.bounds().size.height);
+                            let max_scroll =
+                                (this.content_height(line_height) - viewport).max(0.);
+                            let scrolled =
+                                (-f32::from(this.scroll_handle.offset().y)).max(0.);
+                            if delta > 0. {
+                                this.follow = false;
+                            } else if at_bottom(scrolled - delta, max_scroll) {
+                                this.follow = true;
+                            }
+                        },
+                    ))
                     .children(self.rows.iter().map(|row| {
                         let (marker, marker_color, text, text_color) = match row.state {
                             RowState::Pending => (
@@ -631,6 +686,9 @@ impl Main {
                                         pointer,
                                         bar.height / 2.,
                                     );
+                                    // A click at the bottom rejoins the tail.
+                                    this.follow =
+                                        at_bottom(offset, (content - viewport).max(0.));
                                     this.scroll_handle
                                         .set_offset(point(px(0.), px(-offset)));
                                     cx.notify();
@@ -650,6 +708,10 @@ impl Main {
                                     let offset = scroll_offset_for_pointer(
                                         strip, content, viewport, pointer, grab,
                                     );
+                                    // Dragging away from the bottom leaves the
+                                    // tail; dragging back rejoins it.
+                                    this.follow =
+                                        at_bottom(offset, (content - viewport).max(0.));
                                     let scrolled =
                                         (-f32::from(this.scroll_handle.offset().y)).max(0.);
                                     if (offset - scrolled).abs() > f32::EPSILON {
@@ -925,6 +987,12 @@ fn scroll_offset_for_pointer(
     (top / travel * max_scroll).clamp(0., max_scroll)
 }
 
+/// Whether a list scrolled `offset` logical pixels from the top has reached
+/// its last row, with a pixel of slack for rounding.
+fn at_bottom(offset: f32, max_scroll: f32) -> bool {
+    offset >= max_scroll - 1.
+}
+
 impl Render for Main {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.screen == Screen::Settings {
@@ -997,7 +1065,28 @@ impl Render for Main {
 
 #[cfg(test)]
 mod tests {
-    use super::{Thumb, scroll_offset_for_pointer, thumb_geometry};
+    use super::{Thumb, at_bottom, scroll_offset_for_pointer, thumb_geometry};
+
+    #[test]
+    fn the_top_of_a_scrollable_list_is_not_the_bottom() {
+        assert!(!at_bottom(0., 400.));
+    }
+
+    #[test]
+    fn exactly_at_the_bottom_counts_as_the_bottom() {
+        assert!(at_bottom(400., 400.));
+    }
+
+    #[test]
+    fn a_pixel_of_rounding_slack_still_counts_as_the_bottom() {
+        assert!(at_bottom(399.5, 400.));
+        assert!(!at_bottom(398.9, 400.));
+    }
+
+    #[test]
+    fn a_list_with_no_scroll_range_is_always_at_the_bottom() {
+        assert!(at_bottom(0., 0.));
+    }
 
     #[test]
     fn a_list_that_fits_gets_a_full_height_thumb_at_the_top() {
