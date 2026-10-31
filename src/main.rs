@@ -573,7 +573,7 @@ impl Main {
                         let viewport = strip + BAR_INSET * 2.;
                         (content > viewport).then(|| {
                             let scrolled = (-f32::from(scroll_handle.offset().y)).max(0.);
-                            thumb_geometry(strip, content, scrolled)
+                            thumb_geometry(strip, content, viewport, scrolled)
                         })
                     },
                     move |bounds, thumb, window, _cx| {
@@ -619,7 +619,7 @@ impl Main {
                                 let _ = weak.update(cx, |this, cx| {
                                     let scrolled =
                                         (-f32::from(this.scroll_handle.offset().y)).max(0.);
-                                    let bar = thumb_geometry(strip, content, scrolled);
+                                    let bar = thumb_geometry(strip, content, viewport, scrolled);
                                     if pointer >= bar.offset && pointer <= bar.offset + bar.height {
                                         this.bar_grab = Some(pointer - bar.offset);
                                         return;
@@ -881,42 +881,48 @@ struct Thumb {
     offset: f32,
 }
 
-/// Thumb geometry for a `track`-tall bar over `content`-tall rows scrolled
-/// `offset` from the top. A list that fits gets a full-height thumb at the top
-/// (the caller then draws no bar); a longer list gets a thumb proportional to
-/// the visible fraction, never shorter than the grab minimum, and pinned to the
-/// track's ends at the scroll extremes.
-fn thumb_geometry(track: f32, content: f32, offset: f32) -> Thumb {
+/// Thumb geometry for a `track`-tall bar over `content`-tall rows in a
+/// `viewport`-tall list scrolled `offset` from the top. The strip is inset, so
+/// the viewport is taller than the track. A list that fits gets a full-height
+/// thumb at the top (the caller then draws no bar); a longer list gets a thumb
+/// proportional to the visible fraction, never shorter than the grab minimum,
+/// and pinned to the track's ends at the scroll extremes.
+fn thumb_geometry(track: f32, content: f32, viewport: f32, offset: f32) -> Thumb {
     /// Comfortable to grab even on a very long list.
     const MIN_THUMB: f32 = 24.;
     let track = track.max(0.);
-    if content <= track {
+    if content <= viewport {
         return Thumb {
             height: track,
             offset: 0.,
         };
     }
-    let height = (track * track / content).clamp(MIN_THUMB.min(track), track);
-    let progress = (offset / (content - track)).clamp(0., 1.);
+    let height = (track * (viewport / content)).clamp(MIN_THUMB.min(track), track);
+    let progress = (offset / (content - viewport)).clamp(0., 1.);
     Thumb {
         height,
         offset: progress * (track - height),
     }
 }
 
-/// Scroll position (px from the top) that puts the thumb's top at
-/// `pointer - grab` on a `track`-tall bar, where `grab` is how far into the
-/// thumb the pointer is. A track click passes half the thumb height so the
-/// thumb centres on the click. Clamped to the list's real scroll range, whose
-/// viewport is the bar plus its top and bottom insets.
-fn scroll_offset_for_pointer(track: f32, content: f32, viewport: f32, pointer: f32, grab: f32) -> f32 {
+/// Exact inverse of [`thumb_geometry`]: the scroll position that puts the
+/// thumb's top at `pointer - grab` on a `track`-tall bar, where `grab` is how
+/// far into the thumb the pointer is. A track click passes half the thumb
+/// height so the thumb centres on the click. Clamped to the scroll range.
+fn scroll_offset_for_pointer(
+    track: f32,
+    content: f32,
+    viewport: f32,
+    pointer: f32,
+    grab: f32,
+) -> f32 {
     let max_scroll = (content - viewport).max(0.);
-    let travel = (track - thumb_geometry(track, content, 0.).height).max(0.);
+    let travel = (track - thumb_geometry(track, content, viewport, 0.).height).max(0.);
     if max_scroll == 0. || travel == 0. {
         return 0.;
     }
     let top = (pointer - grab).clamp(0., travel);
-    (top / travel * (content - track)).clamp(0., max_scroll)
+    (top / travel * max_scroll).clamp(0., max_scroll)
 }
 
 impl Render for Main {
@@ -996,7 +1002,7 @@ mod tests {
     #[test]
     fn a_list_that_fits_gets_a_full_height_thumb_at_the_top() {
         assert_eq!(
-            thumb_geometry(300., 200., 0.),
+            thumb_geometry(300., 200., 300., 0.),
             Thumb {
                 height: 300.,
                 offset: 0.
@@ -1007,33 +1013,53 @@ mod tests {
     #[test]
     fn the_thumb_is_proportional_to_the_visible_fraction() {
         // Half the content fits: a 400px track over 800px of rows.
-        let thumb = thumb_geometry(400., 800., 0.);
+        let thumb = thumb_geometry(400., 800., 400., 0.);
         assert_eq!(thumb.height, 200.);
 
         // Halfway down the list, the thumb sits halfway along its travel.
-        let thumb = thumb_geometry(400., 800., 200.);
+        let thumb = thumb_geometry(400., 800., 400., 200.);
         assert_eq!(thumb.offset, 100.);
     }
 
     #[test]
     fn the_thumb_never_shrinks_below_the_grabbable_minimum() {
         // A 300px track over a 30,000px list would be a 3px thumb.
-        let thumb = thumb_geometry(300., 30_000., 0.);
+        let thumb = thumb_geometry(300., 30_000., 300., 0.);
         assert_eq!(thumb.height, 24.);
     }
 
     #[test]
     fn the_thumb_is_pinned_to_the_ends() {
-        let top = thumb_geometry(400., 800., 0.);
+        let top = thumb_geometry(400., 800., 400., 0.);
         assert_eq!(top.offset, 0.);
 
         // At the bottom of the scroll range the thumb's bottom meets the track.
-        let bottom = thumb_geometry(400., 800., 400.);
+        let bottom = thumb_geometry(400., 800., 400., 400.);
         assert_eq!(bottom.height, 200.);
         assert_eq!(bottom.offset, 200.);
 
         // Overscroll past the end stays pinned instead of running off the track.
-        assert_eq!(thumb_geometry(400., 800., 9_999.).offset, 200.);
+        assert_eq!(thumb_geometry(400., 800., 400., 9_999.).offset, 200.);
+    }
+
+    #[test]
+    fn an_inset_bar_reaches_the_track_bottom_at_the_end() {
+        // The 388px strip sits inside a 400px list viewport (6px inset top and
+        // bottom), and 500px of rows just overflows it.
+        let track = 388.;
+        let viewport = 400.;
+        let content = 500.;
+        let max_scroll = content - viewport;
+
+        let bottom = thumb_geometry(track, content, viewport, max_scroll);
+        assert!((bottom.offset + bottom.height - track).abs() < 0.01);
+
+        // The pointer mapping is the exact inverse: the track's bottom maps to
+        // the scroll range's end, and back to a thumb flush with the bottom.
+        let offset = scroll_offset_for_pointer(track, content, viewport, track, 0.);
+        assert!((offset - max_scroll).abs() < 0.01);
+        let round_trip = thumb_geometry(track, content, viewport, offset);
+        assert!((round_trip.offset + round_trip.height - track).abs() < 0.01);
     }
 
     #[test]
@@ -1069,7 +1095,7 @@ mod tests {
     fn grabbing_the_thumb_keeps_the_grab_offset() {
         // Thumb at scroll 200 sits 100px down the track, 200px tall. Grab it
         // 50px from its top and the drag maps straight back to scroll 200.
-        let thumb = thumb_geometry(400., 800., 200.);
+        let thumb = thumb_geometry(400., 800., 400., 200.);
         assert_eq!(thumb.offset, 100.);
         assert_eq!(
             scroll_offset_for_pointer(400., 800., 400., thumb.offset + 50., 50.),
