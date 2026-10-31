@@ -11,8 +11,9 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use gpui::{
-    AnyElement, App, Application, Bounds, Context, Entity, KeyBinding, Render, Task,
-    TitlebarOptions, Window, WindowBounds, WindowOptions, div, prelude::*, px, relative, rgb,
+    AnyElement, App, Application, Bounds, Context, Entity, KeyBinding, Render, ScrollHandle, Task,
+    TitlebarOptions, Window, WindowBounds, WindowOptions, canvas, div, point, prelude::*, px, quad,
+    relative, rgb, size, transparent_black,
 };
 
 use field::{Backspace, Commit, Delete, Field, Paste, SelectAll};
@@ -87,6 +88,9 @@ struct Main {
     /// it into [`Settings`].
     usb_power_fix: bool,
     save_error: Option<String>,
+    /// Scroll state of the file list, shared with the list element so the
+    /// scrollbar overlay can read the current offset.
+    scroll_handle: ScrollHandle,
 }
 
 impl Main {
@@ -113,6 +117,7 @@ impl Main {
             dest_field: cx.new(|cx| Field::new("Destination root", cx)),
             format_field: cx.new(|cx| Field::new("YYYYMMDD", cx)),
             save_error: None,
+            scroll_handle: ScrollHandle::new(),
         }
     }
 
@@ -171,6 +176,9 @@ impl Main {
             return;
         }
         self.rows = Self::scan_rows();
+        // A fresh scan starts at the first file. `set_offset` does not notify,
+        // so the `cx.notify()` below is what repaints the list and the bar.
+        self.scroll_handle.set_offset(point(px(0.), px(0.)));
         self.reset_run();
         cx.notify();
     }
@@ -472,7 +480,7 @@ impl Main {
             )
     }
 
-    fn rows_area(&self) -> AnyElement {
+    fn rows_area(&self, window: &Window) -> AnyElement {
         if self.rows.is_empty() {
             return div().flex_1()
                 .min_h_0()
@@ -485,52 +493,108 @@ impl Main {
                 )
                 .into_any_element();
         }
-        div().id("rows")
+        // shortcut: content height is one text line plus the rows' 12px of
+        // vertical padding (`py(px(6.))`). Reading `max_offset()` instead would
+        // be empty on the first paint and stale after a Refresh, because gpui
+        // updates the handle in prepaint, after render. Teach rows a second
+        // line or more padding and this formula must follow.
+        let content = (window.line_height() + px(12.)) * self.rows.len() as f32;
+        let scroll_handle = self.scroll_handle.clone();
+        const BAR_INSET: f32 = 6.;
+        div().relative()
             .flex_1()
             .min_h_0()
-            .overflow_y_scroll()
-            .children(self.rows.iter().map(|row| {
-                let (marker, marker_color, text, text_color) = match row.state {
-                    RowState::Pending => (
-                        "·",
-                        0x44505e,
-                        row.src.to_string_lossy().into_owned(),
-                        0x77828f,
-                    ),
-                    RowState::Imported => (
-                        "✓",
-                        0x33dd88,
-                        format!(
-                            "{}  →  {}",
-                            row.src.display(),
-                            row.dest.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
-                        ),
-                        0xd7e0ea,
-                    ),
-                    RowState::Failed => (
-                        "✗",
-                        0xff6b6b,
-                        format!("{}  (failed)", row.src.display()),
-                        0xff6b6b,
-                    ),
-                    RowState::Skipped => (
-                        "=",
-                        0x7d8aa0,
-                        format!(
-                            "{}  →  {} (already in Destination)",
-                            row.src.display(),
-                            row.dest.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
-                        ),
-                        0x9fb0c3,
-                    ),
-                };
-                div().flex()
-                    .gap_3()
-                    .px_6()
-                    .py(px(6.))
-                    .child(div().w(px(14.)).text_color(rgb(marker_color)).child(marker))
-                    .child(div().flex_1().truncate().text_color(rgb(text_color)).child(text))
-            }))
+            .child(
+                div().id("rows")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll_handle)
+                    .children(self.rows.iter().map(|row| {
+                        let (marker, marker_color, text, text_color) = match row.state {
+                            RowState::Pending => (
+                                "·",
+                                0x44505e,
+                                row.src.to_string_lossy().into_owned(),
+                                0x77828f,
+                            ),
+                            RowState::Imported => (
+                                "✓",
+                                0x33dd88,
+                                format!(
+                                    "{}  →  {}",
+                                    row.src.display(),
+                                    row.dest.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
+                                ),
+                                0xd7e0ea,
+                            ),
+                            RowState::Failed => (
+                                "✗",
+                                0xff6b6b,
+                                format!("{}  (failed)", row.src.display()),
+                                0xff6b6b,
+                            ),
+                            RowState::Skipped => (
+                                "=",
+                                0x7d8aa0,
+                                format!(
+                                    "{}  →  {} (already in Destination)",
+                                    row.src.display(),
+                                    row.dest.as_ref().map(|d| d.to_string_lossy().into_owned()).unwrap_or_default()
+                                ),
+                                0x9fb0c3,
+                            ),
+                        };
+                        div().flex()
+                            .gap_3()
+                            .px_6()
+                            .py(px(6.))
+                            .child(div().w(px(14.)).text_color(rgb(marker_color)).child(marker))
+                            .child(div().flex_1().truncate().text_color(rgb(text_color)).child(text))
+                    })),
+            )
+            .child(
+                // The bar is a canvas because gpui 0.2.2 ships no scrollbar
+                // element. It deliberately has no id and no hitbox, so it never
+                // becomes a mouse target and the wheel reaches the list under
+                // its strip. It overlays the rows' right margin only.
+                canvas(
+                    move |bounds, _window, _cx| {
+                        let strip = f32::from(bounds.size.height);
+                        // The bar is inset top and bottom, so the list viewport
+                        // is taller than the strip; a list that only overflows
+                        // into that inset still fits and draws no bar.
+                        let viewport = strip + BAR_INSET * 2.;
+                        let content = f32::from(content);
+                        (content > viewport).then(|| {
+                            let scrolled = (-f32::from(scroll_handle.offset().y)).max(0.);
+                            thumb_geometry(strip, content, scrolled)
+                        })
+                    },
+                    |bounds, thumb, window, _cx| {
+                        let Some(thumb) = thumb else { return };
+                        let draw = |window: &mut Window, height: f32, offset: f32, color: u32| {
+                            window.paint_quad(quad(
+                                Bounds::new(
+                                    point(bounds.left(), bounds.top() + px(offset)),
+                                    size(bounds.size.width, px(height)),
+                                ),
+                                px(3.),
+                                rgb(color),
+                                px(0.),
+                                transparent_black(),
+                                Default::default(),
+                            ));
+                        };
+                        draw(window, f32::from(bounds.size.height), 0., 0x232b3a);
+                        draw(window, thumb.height, thumb.offset, 0x44505e);
+                    },
+                )
+                .absolute()
+                .top(px(BAR_INSET))
+                .bottom(px(BAR_INSET))
+                .right(px(4.))
+                .w(px(6.)),
+            )
             .into_any_element()
     }
 
@@ -726,13 +790,43 @@ impl Main {
     }
 }
 
+/// Height and top offset of the file list's scrollbar thumb, in logical pixels.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Thumb {
+    height: f32,
+    offset: f32,
+}
+
+/// Thumb geometry for a `track`-tall bar over `content`-tall rows scrolled
+/// `offset` from the top. A list that fits gets a full-height thumb at the top
+/// (the caller then draws no bar); a longer list gets a thumb proportional to
+/// the visible fraction, never shorter than the grab minimum, and pinned to the
+/// track's ends at the scroll extremes.
+fn thumb_geometry(track: f32, content: f32, offset: f32) -> Thumb {
+    /// Comfortable to grab even on a very long list.
+    const MIN_THUMB: f32 = 24.;
+    let track = track.max(0.);
+    if content <= track {
+        return Thumb {
+            height: track,
+            offset: 0.,
+        };
+    }
+    let height = (track * track / content).clamp(MIN_THUMB.min(track), track);
+    let progress = (offset / (content - track)).clamp(0., 1.);
+    Thumb {
+        height,
+        offset: progress * (track - height),
+    }
+}
+
 impl Render for Main {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if self.screen == Screen::Settings {
             return self.settings_view(cx);
         }
         let header = self.header();
-        let rows_area = self.rows_area();
+        let rows_area = self.rows_area(window);
         div().size_full()
             .flex()
             .flex_col()
@@ -796,6 +890,54 @@ impl Render for Main {
 }
 
 
+#[cfg(test)]
+mod tests {
+    use super::{Thumb, thumb_geometry};
+
+    #[test]
+    fn a_list_that_fits_gets_a_full_height_thumb_at_the_top() {
+        assert_eq!(
+            thumb_geometry(300., 200., 0.),
+            Thumb {
+                height: 300.,
+                offset: 0.
+            }
+        );
+    }
+
+    #[test]
+    fn the_thumb_is_proportional_to_the_visible_fraction() {
+        // Half the content fits: a 400px track over 800px of rows.
+        let thumb = thumb_geometry(400., 800., 0.);
+        assert_eq!(thumb.height, 200.);
+
+        // Halfway down the list, the thumb sits halfway along its travel.
+        let thumb = thumb_geometry(400., 800., 200.);
+        assert_eq!(thumb.offset, 100.);
+    }
+
+    #[test]
+    fn the_thumb_never_shrinks_below_the_grabbable_minimum() {
+        // A 300px track over a 30,000px list would be a 3px thumb.
+        let thumb = thumb_geometry(300., 30_000., 0.);
+        assert_eq!(thumb.height, 24.);
+    }
+
+    #[test]
+    fn the_thumb_is_pinned_to_the_ends() {
+        let top = thumb_geometry(400., 800., 0.);
+        assert_eq!(top.offset, 0.);
+
+        // At the bottom of the scroll range the thumb's bottom meets the track.
+        let bottom = thumb_geometry(400., 800., 400.);
+        assert_eq!(bottom.height, 200.);
+        assert_eq!(bottom.offset, 200.);
+
+        // Overscroll past the end stays pinned instead of running off the track.
+        assert_eq!(thumb_geometry(400., 800., 9_999.).offset, 200.);
+    }
+}
+
 fn main() {
     Application::new().run(|cx: &mut App| {
         cx.bind_keys([
@@ -806,7 +948,7 @@ fn main() {
             KeyBinding::new("ctrl-v", Paste, None),
             KeyBinding::new("enter", Commit, None),
         ]);
-        let bounds = Bounds::centered(None, gpui::size(px(960.), px(640.)), cx);
+        let bounds = Bounds::centered(None, size(px(960.), px(640.)), cx);
         cx.open_window(
             WindowOptions {
                 titlebar: Some(TitlebarOptions {
